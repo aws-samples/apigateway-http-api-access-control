@@ -15,6 +15,11 @@ Parameters:
     Description: Rotation interval in days for origin secret value.
     Type: Number
     MinValue: "1"
+  LogRetention:
+    Default: "30"
+    Description: Log retention period for HTTP API access logs
+    Type: Number
+    MinValue: "1"
 
 
 Resources:
@@ -24,7 +29,6 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
         Description: "Sample Hello World Lambda"
-        FunctionName: "SampleWebsite"
         Runtime: python3.7
         Handler: index.lambda_handler
         Role: !GetAtt sampleWebsiteLambdaFunctionRole.Arn
@@ -149,18 +153,16 @@ Resources:
   OriginSecretRotateFunction:
     Type: AWS::Lambda::Function
     Properties:
-      Description: Serets Manager Rotation Lambda
-      FunctionName: OriginSecretRotate
+      Description: Secrets Manager Rotation Lambda
       Handler: index.lambda_handler
       Runtime: python3.7
       Environment:
         Variables:
           CFDISTROID: !Ref cloudFrontDistribution
           HEADERNAME: "x-origin-verify"
+          ORIGINURL: !Sub "${apiGateway.ApiEndpoint}"
       Role: !GetAtt OriginSecretRotateExecutionRole.Arn
       Code:
-        #S3Bucket: !Ref ArtifactsBucket
-        #S3Key: !Sub ${ArtifactsPrefix}origin-secret-rotate.zip
         ZipFile: 
             |-
             from __future__ import print_function
@@ -186,7 +188,7 @@ Resources:
 
             CFDistroId = os.environ['CFDISTROID']
             HeaderName = os.environ['HEADERNAME']
-            #OriginUrl = os.environ['ORIGINURL']
+            OriginUrl = os.environ['ORIGINURL']
             #StackName = os.environ['STACKNAME']
 
 
@@ -253,6 +255,19 @@ Resources:
                 else:
                     logger.error("Distribution Id, %s status is not Deployed." % distroid)
                     raise ValueError("Distribution Id, %s status is not Deployed." % distroid)
+
+            def test_origin(url, secret):
+                response = requests.get(
+                url,
+                headers={HeaderName: secret},
+                )
+                
+                logger.info("Testing URL, %s - response code, %s " % (url, response.status_code))
+
+                if response.status_code == 200:
+                    return True
+                else:
+                    return False
 
             def create_secret(service_client, arn, token):
                 """Create the secret
@@ -346,6 +361,55 @@ Resources:
                     logger.error('Error: {}'.format(e))
                     raise ValueError("Failed to update resources CloudFront Distro Id %s " % (CFDistroId))
 
+            def test_secret(service_client, arn, token):
+                """Test the secret
+                This method should validate that the AWSPENDING secret works in the service that the secret belongs to. For example, if the secret
+                is a database credential, this method should validate that the user can login with the password in AWSPENDING and that the user has
+                all of the expected permissions against the database.
+                Args:
+                    service_client (client): The secrets manager service client
+                    arn (string): The secret ARN or other identifier
+                    token (string): The ClientRequestToken associated with the secret version
+                """
+                # This is where the secret should be tested against the service
+
+                # Obtain secret value for AWSPENDING
+                pending = service_client.get_secret_value(
+                SecretId=arn, 
+                VersionId=token, 
+                VersionStage="AWSPENDING"
+                )
+
+                # Obtain secret value for AWSCURRENT
+                metadata = service_client.describe_secret(SecretId=arn)
+                for version in metadata["VersionIdsToStages"]:
+                    if "AWSCURRENT" in metadata["VersionIdsToStages"][version]:
+                        currenttoken = version
+                        current = service_client.get_secret_value(
+                        SecretId=arn, 
+                        VersionId=currenttoken, 
+                        VersionStage="AWSCURRENT"
+                        )
+                        logger.info("Getting current version %s for %s" % (version, arn))
+
+                pendingsecret = json.loads(pending['SecretString'])
+                currentsecret = json.loads(current['SecretString'])
+
+                secrets = [pendingsecret['HEADERVALUE'], currentsecret['HEADERVALUE']]
+
+                # Test origin URL access functional using validation headers for AWSPENDING and AWSCURRENT
+                try:
+                    for s in secrets:
+                        if test_origin(OriginUrl, s):
+                            pass
+                        else:
+                            logger.error("Tests failed for URL, %s " % OriginUrl)
+                            raise ValueError("Tests failed for URL, %s " % OriginUrl)
+
+                except ClientError as e:
+                    logger.error('Error: {}'.format(e))
+                    raise e
+
             def finish_secret(service_client, arn, token):
                 """Finish the secret
                 This method finalizes the rotation process by marking the secret version passed in as the AWSCURRENT secret.
@@ -414,7 +478,7 @@ Resources:
                     set_secret(service_client, arn, token)
 
                 elif step == "testSecret":
-                    logger.info("Skipping Test Secret step")
+                    test_secret(service_client, arn, token)
 
                 elif step == "finishSecret":
                     finish_secret(service_client, arn, token)
@@ -428,7 +492,6 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       Description: "Authorizer Lambda Function"
-      FunctionName: AuthorizerLambda
       Runtime: python3.7
       # Timeout has to be atleast 30 sec
       Timeout: 900
@@ -454,10 +517,18 @@ Resources:
 
                 def lambda_handler(event, context):
                     secretName = 'OriginVerifySecret'
+                    secretValue=''
                     try:
-                        get_secret_value_response = client.get_secret_value(
-                            SecretId=secretName
-                        )
+                        get_secret_value_response = client.get_secret_value(SecretId=secretName)
+                        get_pending_secret_value_response = ""
+                        try: 
+                            get_pending_secret_value_response = client.get_secret_value(SecretId=secretName,VersionStage='AWSPENDING')
+                        except ClientError as e:
+                            print (e.response["Error"]["Code"])
+                        
+                        secret_HeaderValue = json.loads(get_secret_value_response['SecretString'])['HEADERVALUE']
+                        if get_pending_secret_value_response:
+                            pending_secret_HeaderValue = json.loads(get_pending_secret_value_response['SecretString'])['HEADERVALUE']
                     except ClientError as e:
                         if e.response['Error']['Code'] == 'DecryptionFailureException':
                             # Secrets Manager can't decrypt the protected secret text using the provided KMS key.
@@ -479,21 +550,13 @@ Resources:
                             # We can't find the resource that you asked for.
                             # Deal with the exception here, and/or rethrow at your discretion.
                             raise e
-                    else:
-                        secretValue=''
-                        # Decrypts secret using the associated KMS key.
-                        # Depending on whether the secret is a string or binary, one of these fields will be populated.
-                        if 'SecretString' in get_secret_value_response:
-                            secretValue = get_secret_value_response['SecretString']
                         else:
-                            decoded_binary_secret = base64.b64decode(get_secret_value_response['SecretBinary'])
-                            
-                        
-                    secret=json.loads(secretValue)
+                            #default
+                            raise e
                     response={
                         "isAuthorized":False
                     }
-                    if (event['headers']['x-origin-verify'] == secret['HEADERVALUE']):
+                    if (event['headers']['x-origin-verify'] == secret_HeaderValue or event['headers']['x-origin-verify'] == pending_secret_HeaderValue):
                         response={
                             "isAuthorized":True
                         }
@@ -505,7 +568,6 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       # Rolename will be randomly generated in CDK
-      RoleName: "AuthorizerLambdaRole"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -574,6 +636,10 @@ Resources:
       StageName: $default
       AutoDeploy: true
       ApiId: !Ref apiGateway
+      AccessLogSettings:
+        DestinationArn: !GetAtt apiLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId", "ip": "$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","routeKey":"$context.routeKey","status":"$context.status"}
 
   apiGwAuthorizer:
     Type: 'AWS::ApiGatewayV2::Authorizer'
@@ -618,7 +684,12 @@ Resources:
           - __Stage__: '*'
             __ApiId__:
               Ref: apiGateway
-  
+
+  apiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: 'HTTPApiAccessLogs'
+      RetentionInDays: !Ref LogRetention
 
   cloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
@@ -658,7 +729,7 @@ Outputs:
 
   cfDistro:
     Description: CloudFront distribution associated with test website
-    Value: !Sub https://console.aws.amazon.com/cloudfront/home?region=${AWS::Region}#distribution-settings:${cloudFrontDistribution}
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudfront/v3/home?region=${AWS::Region}#/distributions/${cloudFrontDistribution}
 
   apiEndpoint: 
     Description: HTTP API Domain URL
